@@ -1,0 +1,345 @@
+// ============================================================
+// Este projeto é um script em Google Apps Script que automatiza a coleta, extração e análise de preços de produtos diretamente no Google Sheets.
+
+//O sistema lê uma lista de produtos na planilha e realiza buscas na internet utilizando a API do Google (via Serper). Quando os resultados não são suficientes, ele utiliza inteligência artificial (Gemini) para extrair preços a partir de textos de páginas web.
+
+//Os dados coletados passam por um processo de validação e filtragem, removendo valores inconsistentes (outliers), e em seguida são utilizados para gerar estatísticas automaticamente dentro da planilha.
+// ============================================================
+
+const SERPER_API_KEY = "tua chave";
+const GEMINI_API_KEY = "tua chave";
+
+const LIMITE_MS = 9 * 60 * 1000;
+
+const COL_MEDIA   = 8;  // H
+const COL_MEDIANA = 9;  // I
+const COL_MAX     = 10; // J
+const COL_QTD     = 11; // K
+const COL_FONTE   = 12; // L
+
+// ============================================================
+// FUNÇÕES PRINCIPAIS
+// ============================================================
+
+function iniciarPesquisa() {
+  cancelarTriggers();
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  let linhaInicio = 2;
+  for (let i = 2; i <= lastRow; i++) {
+    const item = sheet.getRange(i, 1).getValue();
+    const colH = sheet.getRange(i, COL_MEDIA).getValue();
+    if (item && (colH === "" || colH === null)) {
+      linhaInicio = i;
+      break;
+    }
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const resposta = ui.alert(
+    "Iniciar pesquisa",
+    "Continuando a partir da linha " + linhaInicio + ".\n\nO script vai rodar em ciclos automáticos até terminar tudo.",
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta !== ui.Button.YES) return;
+
+  sheet.getRange("H1").setValue("Preco Medio (R$)");
+  sheet.getRange("I1").setValue("Mediana (R$)");
+  sheet.getRange("J1").setValue("Preco Maximo (R$)");
+  sheet.getRange("K1").setValue("Qtd. Precos Encontrados");
+  sheet.getRange("L1").setValue("Fonte");
+
+  PropertiesService.getScriptProperties().setProperty("LINHA_ATUAL", linhaInicio);
+  executarCiclo();
+}
+
+function executarCiclo() {
+  const props = PropertiesService.getScriptProperties();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  let linhaAtual = parseInt(props.getProperty("LINHA_ATUAL") || "2");
+  const inicio = Date.now();
+
+  for (let i = linhaAtual; i <= lastRow; i++) {
+
+    if (Date.now() - inicio > LIMITE_MS) {
+      props.setProperty("LINHA_ATUAL", i);
+      agendarProximoCiclo();
+      return;
+    }
+
+    const nomeProduto = String(sheet.getRange(i, 1).getValue()).trim();
+    if (!nomeProduto) continue;
+
+    const colH = sheet.getRange(i, COL_MEDIA).getValue();
+    if (colH !== "" && colH !== null && colH !== "Buscando...") continue;
+
+    sheet.getRange(i, COL_MEDIA).setValue("Buscando...");
+    SpreadsheetApp.flush();
+
+    try {
+      const resultado = buscarEExtrair(nomeProduto);
+      const precosFiltrados = filtrarOutliers(resultado.precos);
+
+      if (precosFiltrados.length > 0) {
+        sheet.getRange(i, COL_MEDIA).setValue(calcularMedia(precosFiltrados));
+        sheet.getRange(i, COL_MEDIANA).setValue(calcularMediana(precosFiltrados));
+        sheet.getRange(i, COL_MAX).setValue(Math.max(...precosFiltrados));
+        sheet.getRange(i, COL_QTD).setValue(precosFiltrados.length);
+        sheet.getRange(i, COL_FONTE).setValue(resultado.fonte);
+      } else {
+        sheet.getRange(i, COL_MEDIA).setValue("Nao encontrado");
+        sheet.getRange(i, COL_FONTE).setValue("-");
+      }
+
+      SpreadsheetApp.flush();
+      Utilities.sleep(3000);
+
+    } catch (e) {
+      sheet.getRange(i, COL_MEDIA).setValue("Erro: " + e.message);
+      SpreadsheetApp.flush();
+    }
+  }
+
+  cancelarTriggers();
+  props.deleteProperty("LINHA_ATUAL");
+
+  try {
+    SpreadsheetApp.getUi().alert("Pesquisa concluída! Todas as linhas foram processadas.");
+  } catch (e) {}
+}
+
+// ============================================================
+// ETAPA 1 — SERPER BUSCA E EXTRAI PREÇOS DIRETO DO SHOPPING
+// ============================================================
+
+function buscarEExtrair(nomeProduto) {
+  const precos = [];
+  const fontes = [];
+
+  // --- Busca Shopping ---
+  const dadosShopping = chamarSerper(nomeProduto + " preco", "shopping", 10);
+  (dadosShopping.shopping || []).forEach(function(r) {
+    const fonte = (r.source || r.link || "").toLowerCase();
+    if (fonte.includes("mercadolivre") || fonte.includes("olx") || fonte.includes("shopee")) return;
+    const valor = extrairValorPreco(r.price || "");
+    if (valorValido(valor)) {
+      precos.push(valor);
+      const nomeFonte = r.source || fonte;
+      if (nomeFonte && fontes.indexOf(nomeFonte) === -1) fontes.push(nomeFonte);
+    }
+  });
+
+  // Se já achou 2 ou mais preços no shopping, retorna direto sem chamar Gemini
+  if (precos.length >= 2) {
+    return { precos: precos, fonte: fontes.slice(0, 3).join(", ") };
+  }
+
+  // --- Busca Orgânica como fallback ---
+  const snippets = [];
+  const dadosOrganico = chamarSerper(nomeProduto + " preco comprar", "search", 10);
+  (dadosOrganico.organic || []).forEach(function(r) {
+    const link = (r.link || "").toLowerCase();
+    if (link.includes("mercadolivre") || link.includes("olx") || link.includes("shopee")) return;
+    snippets.push((r.title || "") + " | " + (r.snippet || "") + " | " + link);
+  });
+
+  // Se não tem snippets e já tem algum preço do shopping, retorna o que tem
+  if (snippets.length === 0) {
+    return { precos: precos, fonte: fontes.join(", ") || "-" };
+  }
+
+  // Manda snippets pro Gemini extrair preços
+  const resultadoGemini = extrairPrecosComGemini(nomeProduto, snippets);
+
+  // Mescla preços do shopping com os do Gemini
+  const precosFinal = precos.concat(resultadoGemini.precos);
+  const fontesFinal = fontes.concat(
+    (resultadoGemini.fonte && resultadoGemini.fonte !== "-") ? [resultadoGemini.fonte] : []
+  );
+
+  return {
+    precos: precosFinal,
+    fonte: fontesFinal.slice(0, 3).join(", ") || "-"
+  };
+}
+
+function extrairValorPreco(texto) {
+  if (!texto) return NaN;
+  // Remove "agora", "R$", pontos de milhar e converte vírgula decimal
+  var limpo = texto.replace(/agora/gi, "").replace(/R\$/g, "").trim();
+  limpo = limpo.replace(/\./g, "").replace(",", ".");
+  var match = limpo.match(/\d+(\.\d{1,2})?/);
+  return match ? parseFloat(match[0]) : NaN;
+}
+
+function chamarSerper(query, tipo, num) {
+  const url = tipo === "shopping"
+    ? "https://google.serper.dev/shopping"
+    : "https://google.serper.dev/search";
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-API-KEY": SERPER_API_KEY },
+    payload: JSON.stringify({ q: query, gl: "br", hl: "pt-br", num: num || 10 }),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  return JSON.parse(response.getContentText());
+}
+
+// ============================================================
+// ETAPA 2 — GEMINI EXTRAI PREÇOS DOS SNIPPETS ORGÂNICOS
+// ============================================================
+
+function extrairPrecosComGemini(nomeProduto, snippets) {
+  const textoResultados = snippets.join("\n");
+
+  const prompt = "Você é um extrator de preços. Nos textos abaixo, encontre e extraia TODOS os valores em reais (R$) relacionados ao produto \"" + nomeProduto + "\".\n\n" +
+    "TEXTOS:\n" + textoResultados + "\n\n" +
+    "Regras:\n" +
+    "- Extraia qualquer valor em R$ que apareça nos textos\n" +
+    "- Ignore Mercado Livre, OLX e Shopee\n" +
+    "- Retorne os nomes das lojas encontradas\n\n" +
+    "Responda SOMENTE com JSON, sem texto antes ou depois:\n" +
+    "{\"precos\": [19.90, 58.31], \"fonte\": \"loja1, loja2\"}\n\n" +
+    "Se não encontrar nada: {\"precos\": [], \"fonte\": \"-\"}";
+
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=" + GEMINI_API_KEY;
+
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.0, maxOutputTokens: 300 }
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  // Retry automático para sobrecarga
+  for (var t = 1; t <= 3; t++) {
+    const response = UrlFetchApp.fetch(url, options);
+    const json = JSON.parse(response.getContentText());
+
+    if (json.error) {
+      const msg = json.error.message || "";
+      const ehSobrecarga = msg.includes("high demand") || msg.includes("overloaded") || msg.includes("503") || msg.includes("429");
+      if (ehSobrecarga && t < 3) {
+        Utilities.sleep(t * 8000);
+        continue;
+      }
+      throw new Error("Gemini API: " + msg);
+    }
+
+    if (!json.candidates || !json.candidates[0].content) {
+      return { precos: [], fonte: "-" };
+    }
+
+    const textoResposta = json.candidates[0].content.parts[0].text.trim();
+    const matchJson = textoResposta.match(/\{[\s\S]*\}/);
+    if (!matchJson) return { precos: [], fonte: "-" };
+
+    const resultado = JSON.parse(matchJson[0]);
+    return {
+      precos: (resultado.precos || []).map(Number).filter(function(v) { return valorValido(v); }),
+      fonte: resultado.fonte || "-"
+    };
+  }
+
+  return { precos: [], fonte: "-" };
+}
+
+// ============================================================
+// FUNÇÕES UTILITÁRIAS
+// ============================================================
+
+function filtrarOutliers(precos) {
+  if (precos.length < 3) return precos;
+  const sorted = precos.slice().sort(function(a, b) { return a - b; });
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1;
+  return sorted.filter(function(v) { return v >= q1 - 1.5 * iqr && v <= q3 + 1.5 * iqr; });
+}
+
+function valorValido(valor) {
+  return !isNaN(valor) && valor > 1 && valor < 500000;
+}
+
+function calcularMedia(arr) {
+  return Math.round((arr.reduce(function(a, b) { return a + b; }, 0) / arr.length) * 100) / 100;
+}
+
+function calcularMediana(arr) {
+  const sorted = arr.slice().sort(function(a, b) { return a - b; });
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0
+    ? sorted[mid]
+    : Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 100) / 100;
+}
+
+// ============================================================
+// GERENCIAMENTO DE TRIGGERS
+// ============================================================
+
+function agendarProximoCiclo() {
+  cancelarTriggers();
+  ScriptApp.newTrigger("executarCiclo")
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
+
+function cancelarTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === "executarCiclo") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+// ============================================================
+// FUNÇÕES DE MANUTENÇÃO
+// ============================================================
+
+function cancelarPesquisa() {
+  cancelarTriggers();
+  PropertiesService.getScriptProperties().deleteProperty("LINHA_ATUAL");
+  SpreadsheetApp.getUi().alert("Pesquisa cancelada. Rode iniciarPesquisa() para recomeçar de onde parou.");
+}
+
+function reprocessarLinha() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const linhaAtiva = sheet.getActiveRange().getRow();
+  if (linhaAtiva < 2) {
+    SpreadsheetApp.getUi().alert("Selecione uma linha de dados (a partir da linha 2).");
+    return;
+  }
+  sheet.getRange(linhaAtiva, COL_MEDIA, 1, 5).clearContent();
+  SpreadsheetApp.getUi().alert("Linha " + linhaAtiva + " limpa. Rode iniciarPesquisa() para reprocessar.");
+}
+
+function limparTudo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  const ui = SpreadsheetApp.getUi();
+  const resposta = ui.alert(
+    "Atenção",
+    "Isso vai apagar todos os resultados (colunas H a L). Tem certeza?",
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta === ui.Button.YES) {
+    cancelarTriggers();
+    PropertiesService.getScriptProperties().deleteProperty("LINHA_ATUAL");
+    sheet.getRange(2, COL_MEDIA, lastRow - 1, 5).clearContent();
+    ui.alert("Dados limpos! Rode iniciarPesquisa() para recomeçar.");
+  }
+}
