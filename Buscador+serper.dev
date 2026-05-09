@@ -1,5 +1,6 @@
 
-// Este script utiliza a API do Serper para realizar buscas automatizadas com base nos dados da coluna A. Todo o fluxo é executado via Google Apps Script, que centraliza este e os demais códigos do projeto 
+// Este script utiliza a API do Serper para realizar buscas automatizadas com base nos dados da coluna A. Todo o fluxo é executado via Google Apps Script, que centraliza este e os demais códigos do projeto,
+// nesse código eu selecionei algumas lojas que tenho preferência e exclui outras que não são interessantes na minha busca
 
 const SERPER_API_KEY = "Sua_chave";
 
