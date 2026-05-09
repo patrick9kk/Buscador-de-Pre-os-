@@ -1,2 +1,4 @@
-# Buscador-de-Pre-os-
-Esse código é um robô automatizado de pesquisa de preços dentro do Google Sheets (Apps Script). Ele pega uma lista de produtos na planilha, busca preços na internet e preenche automaticamente estatísticas como média, mediana, máximo, quantidade e fontes.
+# Buscador-de-Preços
+Este projeto é um script automatizado para Google Sheets (Apps Script) que realiza a coleta e análise de preços de produtos na internet de forma inteligente e escalável.
+
+A partir de uma lista de produtos, o sistema busca preços utilizando a API do Google (via Serper) e, quando necessário, utiliza inteligência artificial (Gemini) para extrair valores diretamente de resultados orgânicos. Os dados coletados são processados, filtrados e organizados automaticamente na planilha.
