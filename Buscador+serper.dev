@@ -1,0 +1,289 @@
+
+// Este script utiliza a API do Serper para realizar buscas automatizadas com base nos dados da coluna A. Todo o fluxo é executado via Google Apps Script, que centraliza este e os demais códigos do projeto 
+
+const SERPER_API_KEY = "Sua_chave";
+
+const LOJAS = [
+  "lojadomecanico.com.br",
+  "cofermeta.com.br",
+  "casteloforte.com.br",
+  "leroymerlin.com.br",
+  "magazineluiza.com.br",
+  "fujioka.com.br",
+  "loja.br.abb.com"
+];
+
+const LIMITE_MS = 5 * 60 * 1000;
+
+function iniciarPesquisa() {
+  cancelarTriggers();
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  let linhaInicio = 2;
+  for (let i = 2; i <= lastRow; i++) {
+    const item = sheet.getRange(i, 1).getValue();
+    const colC = sheet.getRange(i, 3).getValue();
+    if (item && (colC === "" || colC === null)) {
+      linhaInicio = i;
+      break;
+    }
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const resposta = ui.alert(
+    "Iniciar pesquisa",
+    "Continuando a partir da linha " + linhaInicio + ". Deseja prosseguir?\n\nO script vai rodar em ciclos automaticos ate terminar tudo.",
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta !== ui.Button.YES) return;
+
+  sheet.getRange("C1").setValue("Preco Medio (R$)");
+  sheet.getRange("D1").setValue("Mediana (R$)");
+  sheet.getRange("E1").setValue("Preco Maximo (R$)");
+  sheet.getRange("F1").setValue("Qtd. Precos Encontrados");
+  sheet.getRange("G1").setValue("Fonte");
+
+  PropertiesService.getScriptProperties().setProperty("LINHA_ATUAL", linhaInicio);
+  executarCiclo();
+}
+
+function executarCiclo() {
+  const props = PropertiesService.getScriptProperties();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  let linhaAtual = parseInt(props.getProperty("LINHA_ATUAL") || "2");
+  const inicio = Date.now();
+
+  for (let i = linhaAtual; i <= lastRow; i++) {
+    if (Date.now() - inicio > LIMITE_MS) {
+      props.setProperty("LINHA_ATUAL", i);
+      agendarProximoCiclo();
+      return;
+    }
+
+    const codigoProduto = String(sheet.getRange(i, 1).getValue()).trim();
+    if (!codigoProduto) continue;
+
+    const colC = sheet.getRange(i, 3).getValue();
+    if (colC !== "" && colC !== null && colC !== "Buscando...") continue;
+
+    sheet.getRange(i, 3).setValue("Buscando...");
+    SpreadsheetApp.flush();
+
+    try {
+      const resultado = buscarEmCascata(codigoProduto);
+      const precosFiltrados = filtrarOutliers(resultado.precos);
+
+      if (precosFiltrados.length > 0) {
+        sheet.getRange(i, 3).setValue(calcularMedia(precosFiltrados));
+        sheet.getRange(i, 4).setValue(calcularMediana(precosFiltrados));
+        sheet.getRange(i, 5).setValue(Math.max(...precosFiltrados));
+        sheet.getRange(i, 6).setValue(precosFiltrados.length);
+        sheet.getRange(i, 7).setValue(resultado.fonte);
+      } else {
+        sheet.getRange(i, 3).setValue("Nao encontrado");
+        sheet.getRange(i, 7).setValue("-");
+      }
+
+      SpreadsheetApp.flush();
+      Utilities.sleep(600);
+    } catch (e) {
+      sheet.getRange(i, 3).setValue("Erro: " + e.message);
+      SpreadsheetApp.flush();
+    }
+  }
+
+  cancelarTriggers();
+  props.deleteProperty("LINHA_ATUAL");
+
+  try {
+    SpreadsheetApp.getUi().alert("Pesquisa concluida! Todas as linhas foram processadas.");
+  } catch(e) {}
+}
+
+function buscarEmCascata(codigoProduto) {
+  const resultadoShopping = buscarShoppingLojas(codigoProduto);
+  if (resultadoShopping.precos.length >= 2) return resultadoShopping;
+
+  const resultadoOrganico = buscarOrganicoLojas(codigoProduto);
+  if (resultadoOrganico.precos.length > 0) {
+    const precosMesclados = [...resultadoShopping.precos, ...resultadoOrganico.precos];
+    return {
+      precos: precosMesclados,
+      fonte: resultadoOrganico.fonte || resultadoShopping.fonte
+    };
+  }
+
+  Utilities.sleep(300);
+  const resultadoGeral = buscarShoppingGeral(codigoProduto);
+  if (resultadoGeral.precos.length > 0) return resultadoGeral;
+
+  return { precos: [], fonte: "-" };
+}
+
+function buscarShoppingLojas(codigoProduto) {
+  const query = '"' + codigoProduto + '"';
+  const dados = chamarSerper(query, "shopping", 10);
+  const precos = [];
+  let fontePrioritaria = null;
+
+  (dados.shopping || []).forEach(r => {
+    const link = (r.link || r.source || "").toLowerCase();
+    const lojaEncontrada = LOJAS.find(l => link.includes(l));
+    if (lojaEncontrada) {
+      const valor = extrairValorPreco(r.price || "");
+      if (valorValido(valor)) {
+        precos.push(valor);
+        if (!fontePrioritaria) fontePrioritaria = lojaEncontrada + " (Shopping)";
+      }
+    }
+  });
+
+  return { precos, fonte: fontePrioritaria || null };
+}
+
+function buscarOrganicoLojas(codigoProduto) {
+  const sitesQuery = LOJAS.map(l => "site:" + l).join(" OR ");
+  const query = '"' + codigoProduto + '" preco (' + sitesQuery + ')';
+  const dados = chamarSerper(query, "search", 10);
+  const { precos, loja } = extrairPrecosOrganico(dados);
+  return { precos, fonte: loja ? loja + " (Organico)" : null };
+}
+
+function buscarShoppingGeral(codigoProduto) {
+  const query = '"' + codigoProduto + '" brasil';
+  const dados = chamarSerper(query, "shopping", 5);
+  const precos = [];
+
+  (dados.shopping || []).forEach(r => {
+    const link = (r.link || r.source || "").toLowerCase();
+    if (link.includes("mercadolivre")) return;
+    const valor = extrairValorPreco(r.price || "");
+    if (valorValido(valor)) precos.push(valor);
+  });
+
+  return { precos, fonte: precos.length > 0 ? "Shopping geral" : null };
+}
+
+function chamarSerper(query, tipo, num) {
+  const url = tipo === "shopping"
+    ? "https://google.serper.dev/shopping"
+    : "https://google.serper.dev/search";
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-API-KEY": SERPER_API_KEY },
+    payload: JSON.stringify({ q: query, gl: "br", hl: "pt-br", num: num || 10 })
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  return JSON.parse(response.getContentText());
+}
+
+function extrairPrecosOrganico(dados) {
+  const precos = [];
+  let loja = null;
+  const regex = /R\$\s?([\d.,]+)/g;
+
+  (dados.organic || []).forEach(r => {
+    const texto = (r.snippet || "") + " " + (r.title || "");
+    let match;
+    while ((match = regex.exec(texto)) !== null) {
+      const valor = parseFloat(match[1].replace(/\./g, "").replace(",", "."));
+      if (valorValido(valor)) {
+        precos.push(valor);
+        if (!loja && r.link) {
+          const lojaEncontrada = LOJAS.find(l => r.link.includes(l));
+          if (lojaEncontrada) loja = lojaEncontrada;
+        }
+      }
+    }
+  });
+
+  return { precos, loja };
+}
+
+function extrairValorPreco(texto) {
+  const match = texto.match(/R?\$?\s?([\d.,]+)/);
+  if (!match) return NaN;
+  return parseFloat(match[1].replace(/\./g, "").replace(",", "."));
+}
+
+function filtrarOutliers(precos) {
+  if (precos.length < 3) return precos;
+  const sorted = [...precos].sort((a, b) => a - b);
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1;
+  return sorted.filter(v => v >= q1 - 1.5 * iqr && v <= q3 + 1.5 * iqr);
+}
+
+function valorValido(valor) {
+  return !isNaN(valor) && valor > 1 && valor < 500000;
+}
+
+function calcularMedia(arr) {
+  return Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 100) / 100;
+}
+
+function calcularMediana(arr) {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0
+    ? sorted[mid]
+    : Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 100) / 100;
+}
+
+function agendarProximoCiclo() {
+  cancelarTriggers();
+  ScriptApp.newTrigger("executarCiclo")
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
+
+function cancelarTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "executarCiclo") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+function cancelarPesquisa() {
+  cancelarTriggers();
+  PropertiesService.getScriptProperties().deleteProperty("LINHA_ATUAL");
+  SpreadsheetApp.getUi().alert("Pesquisa cancelada. Rode iniciarPesquisa() para recomecar de onde parou.");
+}
+
+function reprocessarLinha() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const linhaAtiva = sheet.getActiveRange().getRow();
+  if (linhaAtiva < 2) {
+    SpreadsheetApp.getUi().alert("Selecione uma linha de dados (a partir da linha 2).");
+    return;
+  }
+  sheet.getRange(linhaAtiva, 3, 1, 5).clearContent();
+  SpreadsheetApp.getUi().alert("Linha " + linhaAtiva + " limpa. Rode iniciarPesquisa() para reprocessar.");
+}
+
+function limparTudo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  const ui = SpreadsheetApp.getUi();
+  const resposta = ui.alert(
+    "Atencao",
+    "Isso vai apagar todos os resultados (colunas C a G). Tem certeza?",
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta === ui.Button.YES) {
+    cancelarTriggers();
+    PropertiesService.getScriptProperties().deleteProperty("LINHA_ATUAL");
+    sheet.getRange(2, 3, lastRow - 1, 5).clearContent();
+    ui.alert("Dados limpos! Rode iniciarPesquisa() para recomecar.");
+  }
+}
