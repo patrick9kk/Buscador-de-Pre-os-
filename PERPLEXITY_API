@@ -1,0 +1,280 @@
+// ============================================================
+// Este projeto é um script automatizado para Google Sheets (Apps Script) que realiza a busca, extração e análise de preços de produtos na internet utilizando inteligência artificial com acesso direto à web (Perplexity API).
+
+// A partir de uma lista de produtos inserida na planilha, o sistema pesquisa preços atualizados em lojas brasileiras, processa os dados coletados e gera estatísticas automaticamente, como média, mediana e valor máximo.
+// ============================================================
+
+const PERPLEXITY_API_KEY = "tua chave"; // perplexity.ai/settings/api
+
+const LIMITE_MS = 9 * 60 * 1000;
+
+const COL_MEDIA   = 13; // M
+const COL_MEDIANA = 14; // N
+const COL_MAX     = 15; // O
+const COL_QTD     = 16; // P
+const COL_FONTE   = 17; // Q
+
+// ============================================================
+// FUNÇÕES PRINCIPAIS
+// ============================================================
+
+function iniciarPesquisa() {
+  cancelarTriggers();
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  let linhaInicio = 2;
+  for (let i = 2; i <= lastRow; i++) {
+    const item = sheet.getRange(i, 1).getValue();
+    const colH = sheet.getRange(i, COL_MEDIA).getValue();
+    if (item && (colH === "" || colH === null)) {
+      linhaInicio = i;
+      break;
+    }
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const resposta = ui.alert(
+    "Iniciar pesquisa",
+    "Continuando a partir da linha " + linhaInicio + ".\n\nO script vai rodar em ciclos automáticos até terminar tudo.",
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta !== ui.Button.YES) return;
+
+  sheet.getRange("M1").setValue("Preco Medio (R$)");
+  sheet.getRange("N1").setValue("Mediana (R$)");
+  sheet.getRange("O1").setValue("Preco Maximo (R$)");
+  sheet.getRange("P1").setValue("Qtd. Precos Encontrados");
+  sheet.getRange("Q1").setValue("Fonte");
+
+  PropertiesService.getScriptProperties().setProperty("LINHA_ATUAL", linhaInicio);
+  executarCiclo();
+}
+
+function executarCiclo() {
+  const props = PropertiesService.getScriptProperties();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  let linhaAtual = parseInt(props.getProperty("LINHA_ATUAL") || "2");
+  const inicio = Date.now();
+
+  for (let i = linhaAtual; i <= lastRow; i++) {
+
+    if (Date.now() - inicio > LIMITE_MS) {
+      props.setProperty("LINHA_ATUAL", i);
+      agendarProximoCiclo();
+      return;
+    }
+
+    const nomeProduto = String(sheet.getRange(i, 1).getValue()).trim();
+    if (!nomeProduto) continue;
+
+    const colH = sheet.getRange(i, COL_MEDIA).getValue();
+    if (colH !== "" && colH !== null && colH !== "Buscando...") continue;
+
+    sheet.getRange(i, COL_MEDIA).setValue("Buscando...");
+    SpreadsheetApp.flush();
+
+    try {
+      const resultado = buscarComPerplexity(nomeProduto);
+      const precosFiltrados = filtrarOutliers(resultado.precos);
+
+      if (precosFiltrados.length > 0) {
+        sheet.getRange(i, COL_MEDIA).setValue(calcularMedia(precosFiltrados));
+        sheet.getRange(i, COL_MEDIANA).setValue(calcularMediana(precosFiltrados));
+        sheet.getRange(i, COL_MAX).setValue(Math.max(...precosFiltrados));
+        sheet.getRange(i, COL_QTD).setValue(precosFiltrados.length);
+        sheet.getRange(i, COL_FONTE).setValue(resultado.fonte);
+      } else {
+        sheet.getRange(i, COL_MEDIA).setValue("Nao encontrado");
+        sheet.getRange(i, COL_FONTE).setValue("-");
+      }
+
+      SpreadsheetApp.flush();
+      Utilities.sleep(3000);
+
+    } catch (e) {
+      sheet.getRange(i, COL_MEDIA).setValue("Erro: " + e.message);
+      SpreadsheetApp.flush();
+    }
+  }
+
+  cancelarTriggers();
+  props.deleteProperty("LINHA_ATUAL");
+
+  try {
+    SpreadsheetApp.getUi().alert("Pesquisa concluída! Todas as linhas foram processadas.");
+  } catch (e) {}
+}
+
+// ============================================================
+// BUSCA COM PERPLEXITY (busca online nativa)
+// ============================================================
+
+function buscarComPerplexity(nomeProduto) {
+
+  const prompt = "Pesquise o preço atual do produto \"" + nomeProduto + "\" em lojas brasileiras.\n\n" +
+    "Instruções:\n" +
+    "- Busque em lojas como Leroy Merlin, Magazine Luiza, Mercado Livre não, lojas especializadas\n" +
+    "- Se o nome tiver código de fabricante, use ele para buscar o produto exato\n" +
+    "- Retorne apenas preços encontrados agora, não estimativas\n" +
+    "- Ignore OLX, Shopee e Mercado Livre\n\n" +
+    "Responda SOMENTE com JSON válido, sem texto antes ou depois:\n" +
+    "{\"precos\": [149.90, 210.00], \"fonte\": \"loja1.com.br, loja2.com.br\"}\n\n" +
+    "Se não encontrar nenhum preço real: {\"precos\": [], \"fonte\": \"-\"}";
+
+  const payload = {
+    model: "sonar",
+    messages: [
+      {
+        role: "system",
+        content: "Você é um assistente especializado em pesquisa de preços de produtos industriais e elétricos no Brasil. Sempre busque preços reais e atuais. Responda apenas com JSON, sem texto adicional."
+      },
+      {
+        role: "user",
+        content: prompt
+      }
+    ],
+    max_tokens: 300,
+    temperature: 0.1,
+    search_recency_filter: "month",
+    return_citations: false
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      "Authorization": "Bearer " + PERPLEXITY_API_KEY,
+      "Accept": "application/json"
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  // Retry automático para sobrecarga
+  for (var t = 1; t <= 3; t++) {
+    const response = UrlFetchApp.fetch("https://api.perplexity.ai/chat/completions", options);
+    const json = JSON.parse(response.getContentText());
+
+    // Trata erros de rate limit ou sobrecarga
+    if (json.error) {
+      const msg = String(json.error.message || json.error);
+      const ehSobrecarga = msg.includes("rate") || msg.includes("limit") || msg.includes("overload") || msg.includes("529");
+      if (ehSobrecarga && t < 3) {
+        Utilities.sleep(t * 8000);
+        continue;
+      }
+      throw new Error("Perplexity API: " + msg);
+    }
+
+    // Extrai o texto da resposta
+    const textoResposta = (json.choices && json.choices[0] && json.choices[0].message)
+      ? json.choices[0].message.content.trim()
+      : "";
+
+    if (!textoResposta) return { precos: [], fonte: "-" };
+
+    // Extrai o JSON mesmo que venha com texto ao redor
+    const matchJson = textoResposta.match(/\{[\s\S]*\}/);
+    if (!matchJson) return { precos: [], fonte: "-" };
+
+    const resultado = JSON.parse(matchJson[0]);
+
+    return {
+      precos: (resultado.precos || []).map(Number).filter(function(v) { return valorValido(v); }),
+      fonte: resultado.fonte || "-"
+    };
+  }
+
+  return { precos: [], fonte: "-" };
+}
+
+// ============================================================
+// FUNÇÕES UTILITÁRIAS
+// ============================================================
+
+function filtrarOutliers(precos) {
+  if (precos.length < 3) return precos;
+  const sorted = precos.slice().sort(function(a, b) { return a - b; });
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1;
+  return sorted.filter(function(v) { return v >= q1 - 1.5 * iqr && v <= q3 + 1.5 * iqr; });
+}
+
+function valorValido(valor) {
+  return !isNaN(valor) && valor > 1 && valor < 500000;
+}
+
+function calcularMedia(arr) {
+  return Math.round((arr.reduce(function(a, b) { return a + b; }, 0) / arr.length) * 100) / 100;
+}
+
+function calcularMediana(arr) {
+  const sorted = arr.slice().sort(function(a, b) { return a - b; });
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0
+    ? sorted[mid]
+    : Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 100) / 100;
+}
+
+// ============================================================
+// GERENCIAMENTO DE TRIGGERS
+// ============================================================
+
+function agendarProximoCiclo() {
+  cancelarTriggers();
+  ScriptApp.newTrigger("executarCiclo")
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
+
+function cancelarTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === "executarCiclo") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+// ============================================================
+// FUNÇÕES DE MANUTENÇÃO
+// ============================================================
+
+function cancelarPesquisa() {
+  cancelarTriggers();
+  PropertiesService.getScriptProperties().deleteProperty("LINHA_ATUAL");
+  SpreadsheetApp.getUi().alert("Pesquisa cancelada. Rode iniciarPesquisa() para recomeçar de onde parou.");
+}
+
+function reprocessarLinha() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const linhaAtiva = sheet.getActiveRange().getRow();
+  if (linhaAtiva < 2) {
+    SpreadsheetApp.getUi().alert("Selecione uma linha de dados (a partir da linha 2).");
+    return;
+  }
+  sheet.getRange(linhaAtiva, COL_MEDIA, 1, 5).clearContent();
+  SpreadsheetApp.getUi().alert("Linha " + linhaAtiva + " limpa. Rode iniciarPesquisa() para reprocessar.");
+}
+
+function limparTudo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  const ui = SpreadsheetApp.getUi();
+  const resposta = ui.alert(
+    "Atenção",
+    "Isso vai apagar todos os resultados (colunas H a L). Tem certeza?",
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta === ui.Button.YES) {
+    cancelarTriggers();
+    PropertiesService.getScriptProperties().deleteProperty("LINHA_ATUAL");
+    sheet.getRange(2, COL_MEDIA, lastRow - 1, 5).clearContent();
+    ui.alert("Dados limpos! Rode iniciarPesquisa() para recomeçar.");
+  }
+}
